@@ -3,17 +3,14 @@
 # Flags mirror the T-Head-stack baseline run (serve_dsv4_flash_int8.sh) for comparison:
 # TP=8, max-model-len 65536, fp8 KV, util 0.85, batch budget 32768,
 # no prefix caching / no request logs.
-
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
-
 MODEL=/mnt/cpfs/models/DeepSeek-V4-Flash-0731-Quant-W-INT8-PerChannel-A-INT8-PerToken
 LOG=/workspace/pytorch/vllm_dsv4_fl_bench_serve.log
-
 vllm serve "$MODEL" \
   --tensor-parallel-size 8 \
   --max-model-len 65536 \
   --kv-cache-dtype fp8 \
-  --gpu-memory-utilization 0.85 \
+  --gpu-memory-utilization 0.82 \
   --max-num-batched-tokens 32768 \
   --chat-template /workspace/pytorch/chat_template/chat_template_deepseekv4.jinja \
   --trust-remote-code \

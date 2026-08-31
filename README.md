@@ -6,8 +6,10 @@
 
 | 仓库 | PR 分支 | 内容 |
 |---|---|---|
-| [ziyuhu214/vllm-plugin-FL](https://github.com/ziyuhu214/vllm-plugin-FL) | `feat/deepseek-v4-flash-ppu-perf` | DeepSeek-V4 PPU op 移植、int8 GEMM/MoE 路径、CUDA graph 支持（5 个提交） |
-| [ziyuhu214/FlagGems](https://github.com/ziyuhu214/FlagGems) | `fix/deepseek-v4-ppu-fixes` | fp8 编码、sqlite 锁、int64 偏移三个内核修复（3 个提交） |
+| [ziyuhu214/vllm-plugin-FL](https://github.com/ziyuhu214/vllm-plugin-FL) | `feat/deepseek-v4-flash-ppu-perf` | DeepSeek-V4 PPU op 移植、int8 GEMM/MoE 路径、CUDA graph 支持、qnorm 头填充快速路径（6 个提交） |
+| [ziyuhu214/FlagGems](https://github.com/ziyuhu214/FlagGems) | `fix/deepseek-v4-ppu-fixes` | fp8 编码、sqlite 锁、int64 偏移、qnorm 快速路径四个内核改动（4 个提交） |
+
+**工程细节详见 [`PORTING_REPORT.md`](PORTING_REPORT.md)**（完整移植与优化工程报告：修改清单、算子归属图、性能里程碑、诊断结论存档、遗留事项）。
 
 > ⚠️ 部分代码从 T-Head 厂商 vLLM fork（0.20.1+ppu）逐字移植，厂商授权未确认，**所有仓库保持 private**。
 
@@ -26,7 +28,7 @@ T-Head 为 PPU 提供了一个基于 vLLM 0.20.1 的厂商 fork，DeepSeek-V4-Fl
 | 模型 | DeepSeek-V4-Flash-0731，W-INT8 per-channel / A-INT8 per-token 量化（ModelScope 下载，见 `scripts/download_dsv4_int8.sh`） |
 | 厂商基线栈 | T-Head fork vLLM 0.20.1+ppu（PPUInt8ScaledMMLinearKernel + FlashMLA sparse，闭源内核） |
 | 社区优化栈 | vLLM 0.24.0（官方，empty platform 编译）+ FlagGems v5.3.4 + vllm-plugin-FL（flagos-ai main）+ PPU deep_gemm / acext wheel |
-| 部署参数 | TP=8，max-model-len 65536，fp8 KV cache（fp8_ds_mla），gpu-util 0.85，batch 32768，无 prefix caching |
+| 部署参数 | TP=8，max-model-len 65536，fp8 KV cache（fp8_ds_mla），gpu-util 0.82（短输入可 0.85），batch 32768，无 prefix caching，`VLLM_FL_DSV4_TORCH_COMPILE=1` + FULL_AND_PIECEWISE cudagraph |
 
 启动脚本：厂商基线 `scripts/serve_dsv4_flash_int8.sh`，社区栈 `scripts/serve_dsv4_fl_bench.sh`（两者参数对齐以保证可比性）。
 
@@ -47,9 +49,19 @@ T-Head 为 PPU 提供了一个基于 vLLM 0.20.1 的厂商 fork，DeepSeek-V4-Fl
 | 阶段 | Output tok/s | Mean TTFT (ms) | Mean TPOT (ms) | 说明 |
 |---|---|---|---|---|
 | 初次跑通（08-27，`summary_20260827_130315.csv`） | 706.0 | 8001 | 82.9 | 全 eager、triton 通用内核 |
-| 全部优化后（08-31，`logs/bench_case1_final3.log`，3 轮） | **1206 / 1304 / 1300** | 5411–6816 | 43.8–46.4 | deep_gemm int8 + acext o_proj + FULL_AND_PIECEWISE cudagraph |
+| **最终（08-31，`summary_20260831_145409.csv`，4 轮去首轮）** | **1301.1** | 5339 | 44.0 | 全部优化 + qnorm 头填充快速路径 |
 
-**结论：社区栈从 706 → ~1300 output tok/s（+84%），达到厂商基线（1720）的约 76%；TPOT 从 82.9ms 降到 ~44ms（厂商 33.4ms）。**
+### 3.3 最终三用例总表（vs 厂商基线，4 轮去首轮，256/256 全成功）
+
+| 用例 (prefill/decode/conc) | T-Head 基线 tok/s | 社区栈最终 tok/s | 比例 | 社区栈 TPOT | 社区栈 TTFT |
+|---|---|---|---|---|---|
+| 1024/1024/64 | 1719.8 | **1301** | 76% | 44.0 ms | 5.3 s |
+| 4096/1024/64 | 1161.4 | **702** | 60% | 75.8 ms | 15.8 s |
+| 16384/1024/64 | 480.6 | **334** | 70% | 159.2 ms | 32.8 s |
+
+数据：case1 `results/raw_runs_20260831_145409.csv`（util 0.85），case2/3 `results/logs/bench_cases23_final.log`（util 0.82——长输入在 0.85 下触发 inductor 图执行 OOM，降 util 后全部通过）。
+
+**结论：社区栈 case1 从 706 → 1301 output tok/s（+84%），达厂商基线 76%；TPOT 从 82.9ms 降到 44.0ms（厂商 33.4ms）。** 4096 档位比例偏低（60%）主因是 compile 模式下 KV cache 偏小放大了长输入排队（TTFT 差距大于短输入），见 `PORTING_REPORT.md` 第七、八节。
 
 ## 4. 优化内容（对应 PR 提交）
 
@@ -72,22 +84,24 @@ T-Head 为 PPU 提供了一个基于 vLLM 0.20.1 的厂商 fork，DeepSeek-V4-Fl
    - cudagraph 显存估算门控从 `is_cuda()` 放宽到 `is_cuda_alike()`，否则 KV cache 吃掉 graph pool 余量导致捕获 OOM。
    - graph 显存 profiling 纳入 `BreakableCUDAGraphWrapper`（DeepseekV4 使用），并在每次采样前后 `empty_cache()`——eager warmup 的 allocator 缓存曾虚增约 90 GiB 的 graph 显存估计。
 
-5. benchmark 脚本对齐 DSv4 int8 部署参数。
+5. **qnorm 插入头填充快速路径**（与 FlagGems 第 4 项配套）：padding 头槽位（FlashMLA 要求 64 头 vs TP8 实际 8 头）由 zeros 分配 + 全量 RMSNorm/RoPE 改为 empty 分配 + kernel 内直接写零跳过计算。
+
+6. benchmark 脚本对齐 DSv4 int8 部署参数。
 
 ### 4.2 FlagGems：`fix/deepseek-v4-ppu-fixes`
 
 1. **软件 E4M3FN 编码**：`fused_qnorm_rope_kv_insert_kernel` 原用 `x.to(tl.float8e4nv)` 存 fp8 KV cache，PPU 的 Triton 无 fp8e4nv 类型。新增 `_encode_e4m3fn`（RNE 舍入、含 subnormal 路径、位精确）替换全部 7 处存储点。
 2. **sqlite 调优缓存锁**：TP=8 时 8 个 worker 共享一个 sqlite 调优缓存，同时调优新 shape 时默认 5s busy timeout 直接报 `database is locked` 杀掉 worker；对 sqlite URL 传 `timeout=120`。
 3. **int64 偏移溢出**：`cp_gather_indexer_quant_cache` 的 scale 偏移用 int32 计算，paged cache 超过 ~8k blocks 时溢出、长上下文场景下取错 scale；提升为 int64。
+4. **qnorm kernel `num_real_heads` 快速路径**：padding 头槽位走 store-zeros-and-return，跳过 RMSNorm+RoPE。
 
-## 5. 与厂商基线的剩余差距（~24%）
+## 5. 与厂商基线的剩余差距（case1 ~24%）
 
-推测的主要来源（未逐项归因）：
+详细归因见 `PORTING_REPORT.md` 第六、七节，要点：
 
-- 厂商闭源 FlashMLA sparse attention 内核 vs 社区移植路径的效率差；
-- TPOT 44ms vs 33ms，decode 端内核（MoE grouped GEMM tile 配置、indexer）仍有调优空间；
-- TTFT 5.4s vs 4.0s，prefill 侧 deep_gemm 大 M 形状目前走启发式而非调优配置（`tune_prefill.py` 为此准备，可继续补 prefill 形状调优）；
-- 16384 长上下文档位未在最终配置下复测（08-27 中间版本上曾复现失败，int64 修复即由此发现）。
+- **opaque op 边界开销 + 厂商 C++ 融合算子**（qnorm+rope+quant+insert 一体）+ 编译版 custom allreduce——突破需编译 C++ 扩展或 PPU 工具链升级；
+- **KV cache 24 vs 37 GiB**：PIECEWISE opaque 边界静态缓冲预留 ~9.1GB，放大长输入排队（4096 档位比例 60% 的主因）；根治靠 mHC 原生进图（等 PPU inductor 成熟，native 实现已留存并验证 1-ulp 等价）；
+- 通信（pccl oneshot，decode 中位 15μs）与 indexer decode（0.14ms/层）已近最优。
 
 ## 6. 复现步骤
 
@@ -101,11 +115,11 @@ bash scripts/download_dsv4_int8.sh
 # 3.（可选）重新调优 deep_gemm 配置
 python tuning/tune_dsv4_deepgemm.py
 
-# 4. 启动服务
+# 4. 启动服务（VLLM_FL_DSV4_TORCH_COMPILE=1 + FULL_AND_PIECEWISE，util 0.82）
 bash scripts/serve_dsv4_fl_bench.sh
 
-# 5. 压测（vllm-plugin-FL 仓库内）
-python benchmarks/benchmark_throughput_serve.py
+# 5. 压测：case1 用 vllm-plugin-FL 仓库内 benchmarks/benchmark_throughput_serve.py，
+#    case2/3（4096/16384）用 scripts/rerun_cases23.sh
 ```
 
 ## 7. 目录说明

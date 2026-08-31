@@ -1,0 +1,15 @@
+Successful requests:                     256       
+Output token throughput (tok/s):         1189.45   
+Mean TTFT (ms):                          7610.47   
+Mean TPOT (ms):                          46.40     
+---
+Successful requests:                     256       
+Output token throughput (tok/s):         1228.07   
+Mean TTFT (ms):                          6049.65   
+Mean TPOT (ms):                          46.23     
+---
+Successful requests:                     256       
+Output token throughput (tok/s):         1303.39   
+Mean TTFT (ms):                          5292.70   
+Mean TPOT (ms):                          43.95     
+---
