@@ -1,0 +1,39 @@
+{#- DeepSeek-V4 chat template, aligned with official encoding/encoding_dsv4.py -#}
+{#- Supports: system/user/assistant, multi-turn, thinking flag, tool results merged as text. -#}
+{%- if not add_generation_prompt is defined %}{% set add_generation_prompt = false %}{% endif -%}
+{%- if not thinking is defined %}{% set thinking = false %}{% endif -%}
+{#- find last user index -#}
+{%- set ns = namespace(last_user_idx=-1) -%}
+{%- for m in messages -%}
+  {%- if m['role'] == 'user' %}{% set ns.last_user_idx = loop.index0 %}{% endif -%}
+{%- endfor -%}
+{{- bos_token -}}
+{%- for m in messages -%}
+  {%- if m['role'] == 'system' -%}
+    {{- m['content'] -}}
+  {%- elif m['role'] == 'user' -%}
+    {{- '<｜User｜>' + m['content'] -}}
+  {%- elif m['role'] == 'tool' -%}
+    {{- '<｜User｜><tool_result>' + m['content'] + '</tool_result>' -}}
+  {%- elif m['role'] == 'assistant' -%}
+    {%- if thinking and loop.index0 > ns.last_user_idx -%}
+      {{- (m['reasoning_content'] | default('', true)) + '</think>' -}}
+    {%- endif -%}
+    {{- (m['content'] | default('', true)) + '<｜end▁of▁sentence｜>' -}}
+  {%- endif -%}
+  {#- transition: emit Assistant prefix when next message is assistant -#}
+  {%- if not loop.last and loop.nextitem['role'] == 'assistant' and m['role'] in ['user', 'tool'] -%}
+    {%- if thinking and loop.index0 >= ns.last_user_idx -%}
+      {{- '<｜Assistant｜><think>' -}}
+    {%- else -%}
+      {{- '<｜Assistant｜></think>' -}}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if add_generation_prompt -%}
+  {%- if thinking -%}
+    {{- '<｜Assistant｜><think>' -}}
+  {%- else -%}
+    {{- '<｜Assistant｜></think>' -}}
+  {%- endif -%}
+{%- endif -%}

@@ -1,0 +1,15 @@
+===== Run 1 =====
+Successful requests:                     256       
+Output token throughput (tok/s):         1289.69   
+Mean TTFT (ms):                          5645.65   
+Mean TPOT (ms):                          44.14     
+===== Run 2 =====
+Successful requests:                     256       
+Output token throughput (tok/s):         1235.99   
+Mean TTFT (ms):                          7130.14   
+Mean TPOT (ms):                          44.84     
+===== Run 3 =====
+Successful requests:                     256       
+Output token throughput (tok/s):         1290.34   
+Mean TTFT (ms):                          5584.89   
+Mean TPOT (ms):                          44.18     
