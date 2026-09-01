@@ -1,116 +1,140 @@
-# DeepSeek-V4-Flash 在 T-Head PPU 上的 vLLM 推理性能优化
+# DeepSeek-V4-Flash 在 T-Head PPU 上的 vLLM 推理性能优化 — 项目报告
 
-本仓库汇总 DeepSeek-V4-Flash（W8A8-INT8）在 T-Head PPU（ZW810E ×8）上，用**开源社区技术栈**（官方 vLLM + FlagGems + vllm-plugin-FL）进行推理性能优化的全过程资料：启动/压测脚本、deep_gemm 调优脚本与结果、benchmark 数据，以及本篇优化报告。
+DeepSeek-V4-Flash（W8A8-INT8）在 T-Head PPU（真武 ZW810E ×8）上，用**开源社区技术栈**（官方 vLLM 0.24.0 + FlagGems + vllm-plugin-FL）替代厂商定制栈的推理性能优化项目。
 
 代码改动以 PR 形式提交在两个配套仓库：
 
 | 仓库 | PR 分支 | 内容 |
 |---|---|---|
-| [ziyuhu214/vllm-plugin-FL](https://github.com/ziyuhu214/vllm-plugin-FL) | `feat/deepseek-v4-flash-ppu-perf` | DeepSeek-V4 PPU op 移植、int8 GEMM/MoE 路径、CUDA graph 支持、qnorm 头填充快速路径（6 个提交） |
-| [ziyuhu214/FlagGems](https://github.com/ziyuhu214/FlagGems) | `fix/deepseek-v4-ppu-fixes` | fp8 编码、sqlite 锁、int64 偏移、qnorm 快速路径四个内核改动（4 个提交） |
+| [ziyuhu214/vllm-plugin-FL](https://github.com/ziyuhu214/vllm-plugin-FL/pull/1) | `feat/deepseek-v4-flash-ppu-perf` | DeepSeek-V4 PPU op 移植、int8 GEMM/MoE 路径、CUDA graph 支持等（6 个提交） |
+| [ziyuhu214/FlagGems](https://github.com/ziyuhu214/FlagGems/pull/1) | `fix/deepseek-v4-ppu-fixes` | fp8 编码、sqlite 锁、int64 偏移等内核修复（5 个提交） |
 
-**工程细节详见 [`PORTING_REPORT.md`](PORTING_REPORT.md)**（完整移植与优化工程报告：修改清单、算子归属图、性能里程碑、诊断结论存档、遗留事项）。
+工程细节（完整修改清单、算子归属图、性能里程碑、诊断存档）另见 [`PORTING_REPORT.md`](PORTING_REPORT.md)。
 
 > ⚠️ 部分代码从 T-Head 厂商 vLLM fork（0.20.1+ppu）逐字移植，厂商授权未确认，**所有仓库保持 private**。
 
-## 1. 背景与目标
+## 1. 软硬件环境
 
-T-Head 为 PPU 提供了一个基于 vLLM 0.20.1 的厂商 fork，DeepSeek-V4-Flash 可以直接运行且性能良好。但厂商 fork 版本旧、闭源内核多、难以跟进社区演进。本项目的目标：
-
-1. 先在容器内验证 **T-Head 厂商栈** 的推理性能，作为基线；
-2. 参考厂商实现，把 **社区栈**（vllm-0.24.0 + FlagGems v5.3.4 + vllm-plugin-FL）在 PPU 上补齐、调优，尽量逼近厂商基线。
-
-## 2. 软硬件环境
+### 1.1 PPU 环境（本项目）
 
 | 项 | 值 |
 |---|---|
-| 硬件 | T-Head PPU ZW810E × 8（卡 0–7） |
-| 模型 | DeepSeek-V4-Flash-0731，W-INT8 per-channel / A-INT8 per-token 量化（ModelScope 下载，见 `scripts/download_dsv4_int8.sh`） |
-| 厂商基线栈 | T-Head fork vLLM 0.20.1+ppu（PPUInt8ScaledMMLinearKernel + FlashMLA sparse，闭源内核） |
-| 社区优化栈 | vLLM 0.24.0（官方，empty platform 编译）+ FlagGems v5.3.4 + vllm-plugin-FL（flagos-ai main）+ PPU deep_gemm / acext wheel |
-| 部署参数 | TP=8，max-model-len 65536，fp8 KV cache（fp8_ds_mla），gpu-util 0.82（短输入可 0.85），batch 32768，无 prefix caching，`VLLM_FL_DSV4_TORCH_COMPILE=1` + FULL_AND_PIECEWISE cudagraph |
+| 硬件 | T-Head PPU 真武 ZW810E × 8（16 卡机使用卡 0–7），单卡 96GB HBM2e，SM 8.0 兼容，64 SM，L2 64MB |
+| 单卡算力 | 官方口径：峰值 120 TFLOPS（基础版）；第三方披露：FP16 768 TFLOPS / INT8 1536 TOPS（见 §2.3 口径说明） |
+| 模型 | DeepSeek-V4-Flash-0731，W-INT8 per-channel / A-INT8 per-token 量化（43 层 MoE 256 专家，MLA sparse 注意力） |
+| 厂商基线栈 | T-Head fork vLLM 0.20.1+ppu（PPUInt8ScaledMMLinearKernel + FlashMLA sparse，闭源 C++ 融合内核） |
+| 社区优化栈 | vLLM 0.24.0（官方，empty platform 构建，**本体零修改**）+ FlagGems v5.3.4 + vllm-plugin-FL（flagos-ai main）+ PPU deep_gemm / acext / flash_mla wheel |
+| 部署参数 | TP=8，max-model-len 65536，fp8 KV cache（fp8_ds_mla），util 0.82（短输入可 0.85），batch 32768，无 prefix caching，`VLLM_FL_DSV4_TORCH_COMPILE=1` + FULL_AND_PIECEWISE cudagraph |
 
-启动脚本：厂商基线 `scripts/serve_dsv4_flash_int8.sh`，社区栈 `scripts/serve_dsv4_fl_bench.sh`（两者参数对齐以保证可比性）。
+### 1.2 H100 对照环境
 
-## 3. 性能结果
+| 项 | 值 |
+|---|---|
+| 硬件 | NVIDIA H100 80GB × 8，CUDA 13.0，Driver 580.105.08 |
+| 单卡算力 | 官方口径（SXM，dense）：FP8 1979 TFLOPS / BF16 989 TFLOPS |
+| 软件 | vllm/vllm-openai:v0.26.0 官方镜像 |
+| 模型 | DeepSeek-V4-Flash 原版（FP8 权重） |
+| 部署参数 | TP=8，fp8 KV cache，block-size 256，无 prefix caching |
 
-压测方式：vLLM bench serve，random 数据集，ignore-eos，decode 1024，并发 64，256 条请求，每档取多轮均值（见 `results/*.csv` 与 `results/logs/`）。
+## 2. 性能结果
 
-### 3.1 T-Head 厂商基线（2026-08-26，`summary_20260826_111911.csv`）
+压测口径统一：vLLM bench serve，random 数据集，ignore-eos，decode 1024，并发 64，256 条请求，多轮取均值。
 
-| Prefill | Output tok/s | Mean TTFT (ms) | Mean TPOT (ms) |
-|---|---|---|---|
-| 1024 | **1719.8** | 3964 | 33.4 |
-| 4096 | 1161.4 | 10097 | 45.3 |
-| 16384 | 480.7 | 25396 | 108.4 |
+### 2.1 vs T-Head 厂商栈（同硬件，衡量软件栈完成度）
 
-### 3.2 社区栈优化演进（prefill 1024 / decode 1024 / conc 64）
-
-| 阶段 | Output tok/s | Mean TTFT (ms) | Mean TPOT (ms) | 说明 |
-|---|---|---|---|---|
-| 初次跑通（08-27，`summary_20260827_130315.csv`） | 706.0 | 8001 | 82.9 | 全 eager、triton 通用内核 |
-| **最终（08-31，`summary_20260831_145409.csv`，4 轮去首轮）** | **1301.1** | 5339 | 44.0 | 全部优化 + qnorm 头填充快速路径 |
-
-### 3.3 最终三用例总表（vs 厂商基线，4 轮去首轮，256/256 全成功）
-
-| 用例 (prefill/decode/conc) | T-Head 基线 tok/s | 社区栈最终 tok/s | 比例 | 社区栈 TPOT | 社区栈 TTFT |
+| 用例 (prefill/decode/conc) | T-Head 栈 tok/s | 社区栈（本项目最终） | 比例 | 社区栈 TPOT | 社区栈 TTFT |
 |---|---|---|---|---|---|
 | 1024/1024/64 | 1719.8 | **1301** | 76% | 44.0 ms | 5.3 s |
 | 4096/1024/64 | 1161.4 | **702** | 60% | 75.8 ms | 15.8 s |
 | 16384/1024/64 | 480.6 | **334** | 70% | 159.2 ms | 32.8 s |
 
-数据：case1 `results/raw_runs_20260831_145409.csv`（util 0.85），case2/3 `results/logs/bench_cases23_final.log`（util 0.82——长输入在 0.85 下触发 inductor 图执行 OOM，降 util 后全部通过）。
+优化演进（case1）：初次跑通 706 tok/s → 最终 1301 tok/s（**+84%**）；TPOT 82.9 → 44.0 ms。
+数据：`results/raw_runs_20260831_145409.csv`、`results/logs/bench_cases23_final.log`、基线 `results/summary_20260826_111911.csv`。
 
-**结论：社区栈 case1 从 706 → 1301 output tok/s（+84%），达厂商基线 76%；TPOT 从 82.9ms 降到 44.0ms（厂商 33.4ms）。** 4096 档位比例偏低（60%）主因是 compile 模式下 KV cache 偏小放大了长输入排队（TTFT 差距大于短输入），见 `PORTING_REPORT.md` 第七、八节。
+### 2.2 vs H100（跨硬件，衡量硬件代际差）
 
-## 4. 优化内容（对应 PR 提交）
+H100 数据（8×H100 80GB，vLLM 0.26.0，FP8 模型）：
 
-### 4.1 vllm-plugin-FL：`feat/deepseek-v4-flash-ppu-perf`
+| 用例 | H100 tok/s | PPU 社区栈 tok/s | PPU/H100 | H100 TPOT | PPU TPOT |
+|---|---|---|---|---|---|
+| 1024/1024/64 | 3328.9 | 1301 | 39% | 18.3 ms | 44.0 ms |
+| 4096/1024/64 | 2530.5 | 702 | 28% | 23.4 ms | 75.8 ms |
+| 16384/1024/64 | 1272.4 | 334 | 26% | 44.2 ms | 159.2 ms |
+| 65536/1024/64 | 392.5 | —（未测） | — | 138.3 ms | — |
 
-1. **移植 PPU deep_gemm int8 GEMM/MoE 路径**（`ppu_deep_gemm*.py` + `ppu_deepgemm_configs/`）
-   厂商 fork 用 PPU deep_gemm wheel 跑 int8 dense/grouped GEMM。移植其包装层，使社区 vLLM 的 MoE 与 dense 层直连 deep_gemm，替代慢的通用 triton 路径。附带用 `tuning/tune_dsv4_deepgemm.py` 对本部署的全部 GEMM 形状（MoE up/gate/down @ 32/33 groups、attention dense @ TP8）自动调优，产出 `DeepSeek-V4-Flash-0731-w8a8-int8-tp8,device_name=PPU-ZW810E` 配置。
+### 2.3 单位算力效率（tok/s per TFLOPS，8 卡合计算力为分母）
 
-2. **DeepSeek-V4 专用 op 与运行时补丁**（`deepseek_v4_*.py`、`patches/deepseek_v4_thead.py`）
-   - sparse-attn indexer：上游依赖 NVIDIA `fp8_fp4_mqa_logits`（要求 q/k 同 dtype），PPU 上 indexer Q 为 INT8，改走 deep_gemm 的 `int8_(paged_)mqa_logits`；topk 用 FlagGems `top_k_per_row_*` 替代缺失的 `persistent_topk`。
-   - fp8_ds_mla KV cache 的 compress/insert/gather-dequant、o_proj int8、MHC 系列 op。
-   - 运行时补丁（幂等）：放开 int8 W8A8 MoE 的 NVIDIA-only 门控到 cuda-alike、FlashMLA sparse attention 接线等。
-   - `_C` op 桥接：`dynamic_scaled_int8_quant`、`silu_and_mul` 的 triton/FlagGems fallback；`fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert` 改造成 0.24 的 9 参 head-padding 契约并注册 Meta impl 以支持 torch.compile。
+按**双方官方口径**计算——PPU 120 TFLOPS/卡（8 卡 960T），H100 FP8 dense 1979 TFLOPS/卡（8 卡 15832T）：
 
-3. **acext INT8 W8A8 scaled-MM 线性内核**（`quantization/acext_int8_linear.py`）
-   移植厂商 `PPUInt8ScaledMMLinearKernel` 的 acext 分支：行主序 int8 权重直入 `acext.int8_gemm`，per-token 动态激活量化。在 thead + acext 可用时优先于 cutlass/triton 被内核 oracle 选中。o_proj 走该路径带来最后一档提升（见 `logs/bench_case1_int8oproj.log`）。
+| 用例 | PPU tok/s/TFLOPS | H100 tok/s/TFLOPS | PPU/H100 效率比 |
+|---|---|---|---|
+| 1024/1024/64 | 1.355 | 0.210 | **6.4×** |
+| 4096/1024/64 | 0.731 | 0.160 | 4.6× |
+| 16384/1024/64 | 0.348 | 0.080 | 4.3× |
 
-4. **PPU 上启用 CUDA graph 捕获 + 显存核算修复**（platform/worker/model_runner）
-   - `support_static_graph_mode()` 加入 thead：否则上游强制 `cudagraph_mode=NONE`，decode 全 eager（这是 706 → 1300 中最大的单项收益之一）。
-   - cudagraph 显存估算门控从 `is_cuda()` 放宽到 `is_cuda_alike()`，否则 KV cache 吃掉 graph pool 余量导致捕获 OOM。
-   - graph 显存 profiling 纳入 `BreakableCUDAGraphWrapper`（DeepseekV4 使用），并在每次采样前后 `empty_cache()`——eager warmup 的 allocator 缓存曾虚增约 90 GiB 的 graph 显存估计。
+**口径提示**：PPU 官方「120T」未注明精度，疑似 BF16/基础版口径，与 H100 的 FP8 dense 峰值并非严格对等，上表效率比明显偏高。若按第三方披露的 PPU INT8 1536 TOPS/卡（与本部署 W8A8-INT8 的主 GEMM 精度一致、也与 H100 FP8 口径更对等）重算，效率比为 **0.50× / 0.36× / 0.34×**——即在对等精度口径下，PPU 每单位标称算力的实际产出约为 H100 的 1/3–1/2，与 §4 的胶水层开销及内核成熟度差距一致。两组数字如实并列，取用哪个口径请依据场景自行判断。
 
-5. **qnorm 插入头填充快速路径**（与 FlagGems 第 4 项配套）：padding 头槽位（FlashMLA 要求 64 头 vs TP8 实际 8 头）由 zeros 分配 + 全量 RMSNorm/RoPE 改为 empty 分配 + kernel 内直接写零跳过计算。
+## 3. 优化内容
 
-6. benchmark 脚本对齐 DSv4 int8 部署参数。
+改动全部落在 vllm-plugin-FL 与 FlagGems（vLLM 0.24.0 本体零修改），共 11 个提交。
 
-### 4.2 FlagGems：`fix/deepseek-v4-ppu-fixes`
+### 3.1 vllm-plugin-FL（[PR #1](https://github.com/ziyuhu214/vllm-plugin-FL/pull/1)，6 提交）
 
-1. **软件 E4M3FN 编码**：`fused_qnorm_rope_kv_insert_kernel` 原用 `x.to(tl.float8e4nv)` 存 fp8 KV cache，PPU 的 Triton 无 fp8e4nv 类型。新增 `_encode_e4m3fn`（RNE 舍入、含 subnormal 路径、位精确）替换全部 7 处存储点。
-2. **sqlite 调优缓存锁**：TP=8 时 8 个 worker 共享一个 sqlite 调优缓存，同时调优新 shape 时默认 5s busy timeout 直接报 `database is locked` 杀掉 worker；对 sqlite URL 传 `timeout=120`。
-3. **int64 偏移溢出**：`cp_gather_indexer_quant_cache` 的 scale 偏移用 int32 计算，paged cache 超过 ~8k blocks 时溢出、长上下文场景下取错 scale；提升为 int64。
-4. **qnorm kernel `num_real_heads` 快速路径**：padding 头槽位走 store-zeros-and-return，跳过 RMSNorm+RoPE。
+1. **移植 PPU deep_gemm int8 GEMM/MoE 路径**（`ppu_deep_gemm*.py` + 调优配置）：厂商包装层移植，MoE 与 dense 层直连 PPU deep_gemm wheel；用 `tuning/tune_dsv4_deepgemm.py` 对本部署全部 GEMM 形状自动调优，产出 DSv4-tp8 专属 153 条配置（decode M 1–1024 + prefill M 1536–32768）。
+2. **DeepSeek-V4 专用 op 与运行时补丁**（15 个补丁 + 8 个 op 文件）：int8 sparse-attn indexer（deep_gemm `int8_(paged_)mqa_logits` 替代 NVIDIA-only 路径）、fp8_ds_mla KV cache compress/insert/gather、o_proj int8、mHC opaque op 化、`_C` 算子 triton/FlagGems 桥接、torch.compile 全图模式（`VLLM_FL_DSV4_TORCH_COMPILE=1`）。
+3. **acext INT8 W8A8 scaled-MM 线性内核**：厂商 kernel 类移植，行主序权重直入 `acext.int8_gemm`，thead 平台内核 oracle 首选。
+4. **thead 启用 CUDA graph + 显存核算修复**：`support_static_graph_mode` 白名单、估算门控 `is_cuda()`→`is_cuda_alike()`、BreakableCUDAGraphWrapper 纳入 profiling、修复 allocator 缓存虚增 ~90 GiB 的估算 bug。单项收益最大（decode 从全 eager 到全图）。
+5. **qnorm 插入头填充快速路径**：padding 头槽位（FlashMLA 64 头要求 vs TP8 实际 8 头）跳过 RMSNorm/RoPE。
+6. benchmark 脚本对齐。
 
-## 5. 与厂商基线的剩余差距（case1 ~24%）
+### 3.2 FlagGems（[PR #1](https://github.com/ziyuhu214/FlagGems/pull/1)，5 提交）
 
-详细归因见 `PORTING_REPORT.md` 第六、七节，要点：
+1. **软件 E4M3FN 编码器**：PPU Triton 无 `fp8e4nv` 类型，纯位运算 RNE 实现（含 subnormal），替换 fp8 KV cache 全部 7 处存储点。
+2. **sqlite 调优缓存 busy timeout** 5s→120s：修复 TP=8 并发调优 `database is locked` 崩溃。
+3. **int64 scale 偏移**（正确性修复）：`cp_gather_indexer_quant_cache` int32 溢出，KV cache >8K 块时 IMA 崩溃。
+4. **qnorm kernel `num_real_heads` 快速路径**（与 plugin 第 5 项配套）。
+5. **empty_kernel 依赖警告注释**：见 §4 结论 1。
 
-- **opaque op 边界开销 + 厂商 C++ 融合算子**（qnorm+rope+quant+insert 一体）+ 编译版 custom allreduce——突破需编译 C++ 扩展或 PPU 工具链升级；
-- **KV cache 24 vs 37 GiB**：PIECEWISE opaque 边界静态缓冲预留 ~9.1GB，放大长输入排队（4096 档位比例 60% 的主因）；根治靠 mHC 原生进图（等 PPU inductor 成熟，native 实现已留存并验证 1-ulp 等价）；
-- 通信（pccl oneshot，decode 中位 15μs）与 indexer decode（0.14ms/层）已近最优。
+## 4. Profiling 结果与剩余优化方向
 
-## 6. 复现步骤
+稳态 profile（91% GPU 占用，decode 53.6ms/step，与 TPOT 实测吻合）。摘要存档 `results/profiles/profiler_out_0.txt`。
+
+### 4.1 Decode 每步 GPU 时间分解
+
+| 算子 | ms/step | 占比 | 与 T-Head 对比判断 |
+|---|---|---|---|
+| deep_gemm int8 GEMM（MoE up/down） | 6.6 | 12.4% | 同款内核，无差距 |
+| deep_gemm batched_gemvt（dense 小批量） | 5.3 | 9.9% | 同款，无差距 |
+| flash sparse decode attention | 4.7 | 8.8% | 同款 wheel，无差距 |
+| **empty_kernel（3007 次/步）** | 3.4 | 6.3% | **纯 FL 栈损耗**（结论 1） |
+| aiu cutlass GEMM（acext 线性层） | ~3.0 | 5.6% | 同款，无差距 |
+| hc_prenorm GEMM（mHC 内 tilelang） | 2.7+1.3 | 7.4% | 同款内核 |
+| 通信（twoShot+RING） | 3.8 | 7.2% | pccl 相同；T-Head 或有编译版 custom allreduce 略优 |
+| mhc_pre/post tilelang | 3.0 | 5.6% | 同款内核，但**调用次数 ×2**（结论 3） |
+| copy_kernel（649 次/步） | 1.2 | 2.3% | opaque op 边界拷贝，FL 栈损耗 |
+| per_token_quant_int8（368 次/步） | 1.1 | 2.1% | T-Head 用 C++ 融合量化并进 GEMM 前处理，我们是独立 kernel |
+
+### 4.2 核心结论：差距不在「大算子」，在「胶水」
+
+重计算算子（GEMM / attention / MoE，合计约 60%）与 T-Head 完全同源，**这部分没有差距**。剩余差距全部来自 FL 栈的胶水层：
+
+1. **empty_kernel 6.3%**：FlagGems 把 `torch.empty` 换成了「写零」triton kernel（每步 3007 次启动）。直接去掉会触发 compressor IMA——下游代码隐式依赖这个非标准的清零行为。这是真实的 FlagGems 上游问题（empty 语义被污染），修复需先审计依赖方；已提交带警告注释的 commit 存档（FlagGems `8d3179b0`）。
+2. **小 kernel 启动风暴**：每步 5000+ 次 kernel 启动（empty 3007 + copy 649 + quant 368 + mHC 260 + …），T-Head 的 C++ 融合算子把这些全部合并。profile 给出精确定价：**约 6–8ms/step，即 TPOT 差距 11ms 的大部分**。突破需编译 C++ 扩展或等 PPU inductor 工具链成熟。
+3. **mHC 重复计算（可修，预期收回 ~1ms/step）**：每步 87 次 mhc_pre + 86 次 mhc_post——fused_post_pre 版本没被用上，opaque 包装走了拆开路径。这是三项中唯一纯软件、低成本可修的。
+
+其余遗留（KV cache 24 vs 37 GiB、compile 模式长输入 OOM 需 util 0.82、首启慢等）见 `PORTING_REPORT.md` 第六、七节。
+
+## 5. 复现步骤
 
 ```bash
-# 1. 下载 int8 量化模型
+# 1. 下载 int8 量化模型（ModelScope）
 bash scripts/download_dsv4_int8.sh
 
-# 2. 安装社区栈：vllm-0.24.0（empty platform）、FlagGems（fix/deepseek-v4-ppu-fixes 分支）、
-#    vllm-plugin-FL（feat/deepseek-v4-flash-ppu-perf 分支）、PPU deep_gemm / acext wheel
+# 2. 安装社区栈：
+#    - vllm-0.24.0（官方源码，empty platform 构建）
+#    - FlagGems @ fix/deepseek-v4-ppu-fixes 分支
+#    - vllm-plugin-FL @ feat/deepseek-v4-flash-ppu-perf 分支
+#    - PPU 版 torch/triton/deep_gemm/flash_mla/acext wheel（随厂商容器提供）
 
 # 3.（可选）重新调优 deep_gemm 配置
 python tuning/tune_dsv4_deepgemm.py
@@ -122,14 +146,18 @@ bash scripts/serve_dsv4_fl_bench.sh
 #    case2/3（4096/16384）用 scripts/rerun_cases23.sh
 ```
 
-## 7. 目录说明
+逃生开关：`VLLM_FL_DISABLE_DEEPGEMM_MOE=1`（回退 triton MoE）；不设 `VLLM_FL_DSV4_TORCH_COMPILE`（回退 breakable cudagraph）。
+运维注意：杀服务须连带 `VLLM::Worker` 进程，否则孤儿进程占卡。
+
+## 附：目录说明
 
 ```
-scripts/        服务启动、压测、模型下载脚本（thead 基线 + FL 栈）
-tuning/         deep_gemm 自动调优脚本与分 shard 输出（tune_out/）
-results/        benchmark summary/raw CSV 与最终日志
-chat_template/  DeepSeek-V4 chat template（与官方 encoding_dsv4.py 逐字符对齐验证）
+PORTING_REPORT.md   完整移植与优化工程报告
+scripts/            服务启动、压测、模型下载脚本（thead 基线 + FL 栈）
+tuning/             deep_gemm 自动调优脚本与分 shard 输出（tune_out/）
+results/            benchmark summary/raw CSV、最终日志、profiler 摘要（profiles/）
+chat_template/      DeepSeek-V4 chat template（与官方 encoding_dsv4.py 逐字符对齐验证）
 ```
 
 ---
-*代码与压测由 Claude Code 完成（2026-08-25 ~ 2026-08-31）。*
+*代码与压测由 Claude Code 完成（2026-08-25 ~ 2026-09-01）。*
