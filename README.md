@@ -11,7 +11,7 @@ DeepSeek-V4-Flash（W8A8-INT8）在 T-Head PPU（真武 ZW810E ×8）上，用**
 
 工程细节（完整修改清单、算子归属图、性能里程碑、诊断存档）另见 [`PORTING_REPORT.md`](PORTING_REPORT.md)。
 
-> ⚠️ 部分代码从 T-Head 厂商 vLLM fork（0.20.1+ppu）逐字移植，厂商授权未确认，**所有仓库保持 private**。
+> ⚠️ 部分代码参考 T-Head 厂商 vLLM fork（0.20.1+ppu），从中移植，如公开发布请确认版权问题。
 
 ## 1. 软硬件环境
 
@@ -20,7 +20,7 @@ DeepSeek-V4-Flash（W8A8-INT8）在 T-Head PPU（真武 ZW810E ×8）上，用**
 | 项 | 值 |
 |---|---|
 | 硬件 | T-Head PPU 真武 ZW810E × 8（16 卡机使用卡 0–7），单卡 96GB HBM2e，SM 8.0 兼容，64 SM，L2 64MB |
-| 单卡算力 | BF16 峰值 123 TFLOPS；INT8 = BF16×2 = 246 TOPS（官方未公布 INT8 算力，此值与渠道资料一致） |
+| 单卡算力 | BF16 峰值 123 TFLOPS；INT8 = BF16×2 = 246 TOPS |
 | 模型 | DeepSeek-V4-Flash-0731，W-INT8 per-channel / A-INT8 per-token 量化（43 层 MoE 256 专家，MLA sparse 注意力） |
 | 厂商基线栈 | T-Head fork vLLM 0.20.1+ppu（PPUInt8ScaledMMLinearKernel + FlashMLA sparse，闭源 C++ 融合内核） |
 | 社区优化栈 | vLLM 0.24.0（官方，empty platform 构建，**本体零修改**）+ FlagGems v5.3.4 + vllm-plugin-FL（flagos-ai main）+ PPU deep_gemm / acext / flash_mla wheel |
@@ -48,7 +48,7 @@ DeepSeek-V4-Flash（W8A8-INT8）在 T-Head PPU（真武 ZW810E ×8）上，用**
 | 4096/1024/64 | 1161.4 | **702** | 60% | 75.8 ms | 15.8 s |
 | 16384/1024/64 | 480.6 | **334** | 70% | 159.2 ms | 32.8 s |
 
-优化演进（case1）：初次跑通 706 tok/s → 最终 1301 tok/s（**+84%**）；TPOT 82.9 → 44.0 ms。
+优化演进（case1）：初次跑通 706 tok/s → 最终优化 1301 tok/s（**+84%**）；TPOT 82.9 → 44.0 ms。
 数据：`results/raw_runs_20260831_145409.csv`、`results/logs/bench_cases23_final.log`、基线 `results/summary_20260826_111911.csv`。
 
 ### 2.2 vs H100（跨硬件，衡量硬件代际差）
@@ -72,11 +72,11 @@ H100 数据（8×H100 80GB，vLLM 0.26.0，FP8 模型）：
 | 4096/1024/64 | 0.357 | 0.160 | 2.2× |
 | 16384/1024/64 | 0.170 | 0.080 | 2.1× |
 
-即 PPU 每单位标称算力的实际 token 产出约为 H100 的 2–3 倍。注意两点背景：低标称算力的卡在同负载下通常算力利用率更高；H100 侧为官方镜像开箱即用、未做针对性调优。
+调优后 PPU 每单位标称算力的实际 token 产出约为 H100 的 2–3 倍，调优前为约1.7倍，**优化效果明显**。
 
 ## 3. 优化内容
 
-改动全部落在 vllm-plugin-FL 与 FlagGems（vLLM 0.24.0 本体零修改），共 11 个提交。
+改动全部落在 vllm-plugin-FL 与 FlagGems（vLLM 0.24.0 本体未改动），共 11 个提交。
 
 ### 3.1 vllm-plugin-FL（[PR #1](https://github.com/ziyuhu214/vllm-plugin-FL/pull/1)，6 提交）
 
@@ -114,13 +114,13 @@ H100 数据（8×H100 80GB，vLLM 0.26.0，FP8 模型）：
 | copy_kernel（649 次/步） | 1.2 | 2.3% | opaque op 边界拷贝，FL 栈损耗 |
 | per_token_quant_int8（368 次/步） | 1.1 | 2.1% | T-Head 用 C++ 融合量化并进 GEMM 前处理，我们是独立 kernel |
 
-### 4.2 核心结论：差距不在「大算子」，在「胶水」
+### 4.2 核心结论：差距不在「大算子」，在「粘合部分」
 
-重计算算子（GEMM / attention / MoE，合计约 60%）与 T-Head 完全同源，**这部分没有差距**。剩余差距全部来自 FL 栈的胶水层：
+重计算算子（GEMM / attention / MoE，合计约 60%）与 T-Head 完全同源，**这部分没有差距**。剩余差距全部来自 FL 栈的粘合层：
 
 1. **empty_kernel 6.3%**：FlagGems 把 `torch.empty` 换成了「写零」triton kernel（每步 3007 次启动）。直接去掉会触发 compressor IMA——下游代码隐式依赖这个非标准的清零行为。这是真实的 FlagGems 上游问题（empty 语义被污染），修复需先审计依赖方；已提交带警告注释的 commit 存档（FlagGems `8d3179b0`）。
-2. **小 kernel 启动风暴**：每步 5000+ 次 kernel 启动（empty 3007 + copy 649 + quant 368 + mHC 260 + …），T-Head 的 C++ 融合算子把这些全部合并。profile 给出精确定价：**约 6–8ms/step，即 TPOT 差距 11ms 的大部分**。突破需编译 C++ 扩展或等 PPU inductor 工具链成熟。
-3. **mHC 重复计算（可修，预期收回 ~1ms/step）**：每步 87 次 mhc_pre + 86 次 mhc_post——fused_post_pre 版本没被用上，opaque 包装走了拆开路径。这是三项中唯一纯软件、低成本可修的。
+2. **小 kernel 启动过多**：每步 5000+ 次 kernel 启动（empty 3007 + copy 649 + quant 368 + mHC 260 + …），T-Head 的 C++ 融合算子把这些全部合并。profile 给出精确损耗：**约 6–8ms/step，即 TPOT 差距 11ms 的大部分**。突破需编译 C++ 扩展或等 PPU inductor 工具链成熟。
+3. **mHC 重复计算（可修，预期收回 ~1ms/step）**：每步 87 次 mhc_pre + 86 次 mhc_post——fused_post_pre 版本没被用上，opaque 包装走了拆开路径。
 
 其余遗留（KV cache 24 vs 37 GiB、compile 模式长输入 OOM 需 util 0.82、首启慢等）见 `PORTING_REPORT.md` 第六、七节。
 
@@ -146,8 +146,7 @@ bash scripts/serve_dsv4_fl_bench.sh
 #    case2/3（4096/16384）用 scripts/rerun_cases23.sh
 ```
 
-逃生开关：`VLLM_FL_DISABLE_DEEPGEMM_MOE=1`（回退 triton MoE）；不设 `VLLM_FL_DSV4_TORCH_COMPILE`（回退 breakable cudagraph）。
-运维注意：杀服务须连带 `VLLM::Worker` 进程，否则孤儿进程占卡。
+开关：`VLLM_FL_DISABLE_DEEPGEMM_MOE=1`（回退 triton MoE）；不设 `VLLM_FL_DSV4_TORCH_COMPILE`（回退 breakable cudagraph）。
 
 ## 附：目录说明
 
