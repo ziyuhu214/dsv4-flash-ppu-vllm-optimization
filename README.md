@@ -20,7 +20,7 @@ DeepSeek-V4-Flash（W8A8-INT8）在 T-Head PPU（真武 ZW810E ×8）上，用**
 | 项 | 值 |
 |---|---|
 | 硬件 | T-Head PPU 真武 ZW810E × 8（16 卡机使用卡 0–7），单卡 96GB HBM2e，SM 8.0 兼容，64 SM，L2 64MB |
-| 单卡算力 | 官方口径：峰值 120 TFLOPS（基础版，未注明精度，按 BF16 理解）；由此推算 INT8 ≈ 240 TOPS（BF16×2，与非官方渠道资料的 246 TOPS 相互印证；官方未公布 INT8 算力） |
+| 单卡算力 | BF16 峰值 123 TFLOPS；INT8 = BF16×2 = 246 TOPS（官方未公布 INT8 算力，此值与渠道资料一致） |
 | 模型 | DeepSeek-V4-Flash-0731，W-INT8 per-channel / A-INT8 per-token 量化（43 层 MoE 256 专家，MLA sparse 注意力） |
 | 厂商基线栈 | T-Head fork vLLM 0.20.1+ppu（PPUInt8ScaledMMLinearKernel + FlashMLA sparse，闭源 C++ 融合内核） |
 | 社区优化栈 | vLLM 0.24.0（官方，empty platform 构建，**本体零修改**）+ FlagGems v5.3.4 + vllm-plugin-FL（flagos-ai main）+ PPU deep_gemm / acext / flash_mla wheel |
@@ -64,16 +64,15 @@ H100 数据（8×H100 80GB，vLLM 0.26.0，FP8 模型）：
 
 ### 2.3 单位算力效率（tok/s per TOPS，8 卡合计算力为分母）
 
-统一口径：两边都取**官方 BF16 峰值 ×2** 作为 INT8/FP8 等效算力——PPU 120 TFLOPS ×2 = 240 TOPS/卡（8 卡 1920T），H100 SXM BF16 989.5 TFLOPS ×2 = 1979 TFLOPS/卡（8 卡 15832T，即官方 FP8 dense 峰值）。与两边部署的主 GEMM 精度（PPU W8A8-INT8 / H100 FP8）对应。
+统一口径：两边都取 **BF16 峰值 ×2** 作为 INT8/FP8 等效算力——PPU 123 TFLOPS ×2 = 246 TOPS/卡（8 卡 1968T），H100 SXM BF16 989.5 TFLOPS ×2 = 1979 TFLOPS/卡（8 卡 15832T，即官方 FP8 dense 峰值）。与两边部署的主 GEMM 精度（PPU W8A8-INT8 / H100 FP8）对应。
 
 | 用例 | PPU tok/s/TOPS | H100 tok/s/TFLOPS | PPU/H100 效率比 |
 |---|---|---|---|
-| 1024/1024/64 | 0.678 | 0.210 | **3.2×** |
-| 4096/1024/64 | 0.366 | 0.160 | 2.3× |
-| 16384/1024/64 | 0.174 | 0.080 | 2.2× |
+| 1024/1024/64 | 0.661 | 0.210 | **3.1×** |
+| 4096/1024/64 | 0.357 | 0.160 | 2.2× |
+| 16384/1024/64 | 0.170 | 0.080 | 2.1× |
 
 即 PPU 每单位标称算力的实际 token 产出约为 H100 的 2–3 倍。注意两点背景：低标称算力的卡在同负载下通常算力利用率更高；H100 侧为官方镜像开箱即用、未做针对性调优。
-口径备注：PPU 官方仅公布「基础版峰值 120T」（未注明精度），INT8 240 TOPS 为按 BF16×2 惯例的推算值，与非官方渠道资料的 246 TOPS 基本一致；若官方后续公布确切口径，本表应据此更新。
 
 ## 3. 优化内容
 
