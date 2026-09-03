@@ -6,10 +6,10 @@ DeepSeek-V4-Flash（W8A8-INT8）在 T-Head PPU（真武 ZW810E ×8）上，用**
 
 | 仓库 | PR 分支 | 内容 |
 |---|---|---|
-| [ziyuhu214/vllm-plugin-FL](https://github.com/ziyuhu214/vllm-plugin-FL/pull/1) | `feat/deepseek-v4-flash-ppu-perf` | DeepSeek-V4 PPU op 移植、int8 GEMM/MoE 路径、CUDA graph 支持等（6 个提交） |
-| [ziyuhu214/FlagGems](https://github.com/ziyuhu214/FlagGems/pull/1) | `fix/deepseek-v4-ppu-fixes` | fp8 编码、sqlite 锁、int64 偏移等内核修复（5 个提交） |
+| [ziyuhu214/vllm-plugin-FL](https://github.com/ziyuhu214/vllm-plugin-FL/pull/1) | `feat/deepseek-v4-flash-ppu-perf` | DeepSeek-V4 PPU op 移植、int8 GEMM/MoE 路径、CUDA graph 支持、empty 定向修复等（7 个提交） |
+| [ziyuhu214/FlagGems](https://github.com/ziyuhu214/FlagGems/pull/1) | `fix/deepseek-v4-ppu-fixes` | fp8 编码、sqlite 锁、int64 偏移、aten::empty 接管移除等内核改动（6 个提交） |
 
-工程细节（完整修改清单、算子归属图、性能里程碑、诊断存档）另见 [`PORTING_REPORT.md`](PORTING_REPORT.md)。
+工程细节另见 [`PORTING_REPORT.md`](PORTING_REPORT.md)（移植过程、算子归属图、诊断存档）与 [`MODIFICATIONS_REPORT.md`](MODIFICATIONS_REPORT.md)（逐 commit 核查报告：每条改动的原因、证据出处、与文档不一致处的修正）。
 
 > ⚠️ 部分代码参考 T-Head 厂商 vLLM fork（0.20.1+ppu），从中移植，如公开发布请确认版权问题。
 
@@ -44,12 +44,13 @@ DeepSeek-V4-Flash（W8A8-INT8）在 T-Head PPU（真武 ZW810E ×8）上，用**
 
 | 用例 (prefill/decode/conc) | T-Head 栈 tok/s | 社区栈（本项目最终） | 比例 | 社区栈 TPOT | 社区栈 TTFT |
 |---|---|---|---|---|---|
-| 1024/1024/64 | 1719.8 | **1301** | 76% | 44.0 ms | 5.3 s |
-| 4096/1024/64 | 1161.4 | **702** | 60% | 75.8 ms | 15.8 s |
-| 16384/1024/64 | 480.6 | **334** | 70% | 159.2 ms | 32.8 s |
+| 1024/1024/64 | 1719.8 | **1486.9** | **86.5%** | 38.0 ms | 5.1 s |
+| 4096/1024/64 | 1161.4 | 702 | 60% | 75.8 ms | 15.8 s |
+| 16384/1024/64 | 480.6 | 334 | 70% | 159.2 ms | 32.8 s |
 
-优化演进（case1）：初次跑通 706 tok/s → 最终优化 1301 tok/s（**+84%**）；TPOT 82.9 → 44.0 ms。
-数据：`results/raw_runs_20260831_145409.csv`、`results/logs/bench_cases23_final.log`、基线 `results/summary_20260826_111911.csv`。
+优化演进（case1）：初次跑通 706 tok/s → 1301 tok/s → **empty 定向修复后 1486.9 tok/s（累计 +111%）**；TPOT 82.9 → 44.0 → 38.0 ms。
+
+> **数据时点说明**：1486.9 来自 09-02 加入 empty 定向修复（plugin `f615560` + FlagGems `c993b3c8`）后的压测（`results/logs/case1_emptyfix_v2.log`，4 轮去首轮：1484.06 / 1489.26 / 1487.31）。**4096 / 16384 两档尚未在该配置下重跑**，表中仍为 08-31 数据（`results/logs/bench_cases23_final.log`）；由于 empty 修复作用于 decode 每步的固定开销，这两档预期同样受益，实际值待补测。基线数据 `results/raw_runs_20260826_111911.csv`。
 
 ### 2.2 vs H100（跨硬件，衡量硬件代际差）
 
@@ -57,10 +58,12 @@ H100 数据（8×H100 80GB，vLLM 0.26.0，FP8 模型）：
 
 | 用例 | H100 tok/s | PPU 社区栈 tok/s | PPU/H100 | H100 TPOT | PPU TPOT |
 |---|---|---|---|---|---|
-| 1024/1024/64 | 3328.9 | 1301 | 39% | 18.3 ms | 44.0 ms |
+| 1024/1024/64 | 3328.9 | **1486.9** | **45%** | 18.3 ms | 38.0 ms |
 | 4096/1024/64 | 2530.5 | 702 | 28% | 23.4 ms | 75.8 ms |
 | 16384/1024/64 | 1272.4 | 334 | 26% | 44.2 ms | 159.2 ms |
 | 65536/1024/64 | 392.5 | —（未测） | — | 138.3 ms | — |
+
+（4096 / 16384 为 08-31 数据，未含 empty 修复，见 §2.1 时点说明。）
 
 ### 2.3 单位算力效率（tok/s per TOPS，8 卡合计算力为分母）
 
@@ -68,32 +71,34 @@ H100 数据（8×H100 80GB，vLLM 0.26.0，FP8 模型）：
 
 | 用例 | PPU tok/s/TOPS | H100 tok/s/TFLOPS | PPU/H100 效率比 |
 |---|---|---|---|
-| 1024/1024/64 | 0.661 | 0.210 | **3.1×** |
+| 1024/1024/64 | **0.756** | 0.210 | **3.6×** |
 | 4096/1024/64 | 0.357 | 0.160 | 2.2× |
 | 16384/1024/64 | 0.170 | 0.080 | 2.1× |
 
-调优后 PPU 每单位标称算力的实际 token 产出约为 H100 的 2–3 倍，调优前为约1.7倍，**优化效果明显**。
+调优后 PPU 每单位标称算力的实际 token 产出约为 H100 的 2–3.6 倍，调优前为约1.7倍，**优化效果明显**。（4096 / 16384 两档基于 08-31 数据，未含 empty 修复。）
 
 ## 3. 优化内容
 
-改动全部落在 vllm-plugin-FL 与 FlagGems（vLLM 0.24.0 本体未改动），共 11 个提交。
+改动全部落在 vllm-plugin-FL 与 FlagGems（vLLM 0.24.0 本体未改动），共 13 个提交。
 
-### 3.1 vllm-plugin-FL（[PR #1](https://github.com/ziyuhu214/vllm-plugin-FL/pull/1)，6 提交）
+### 3.1 vllm-plugin-FL（[PR #1](https://github.com/ziyuhu214/vllm-plugin-FL/pull/1)，7 提交）
 
 1. **移植 PPU deep_gemm int8 GEMM/MoE 路径**（`ppu_deep_gemm*.py` + 调优配置）：厂商包装层移植，MoE 与 dense 层直连 PPU deep_gemm wheel；用 `tuning/tune_dsv4_deepgemm.py` 对本部署全部 GEMM 形状自动调优，产出 DSv4-tp8 专属 153 条配置（decode M 1–1024 + prefill M 1536–32768）。
 2. **DeepSeek-V4 专用 op 与运行时补丁**（15 个补丁 + 8 个 op 文件）：int8 sparse-attn indexer（deep_gemm `int8_(paged_)mqa_logits` 替代 NVIDIA-only 路径）、fp8_ds_mla KV cache compress/insert/gather、o_proj int8、mHC opaque op 化、`_C` 算子 triton/FlagGems 桥接、torch.compile 全图模式（`VLLM_FL_DSV4_TORCH_COMPILE=1`）。
 3. **acext INT8 W8A8 scaled-MM 线性内核**：厂商 kernel 类移植，行主序权重直入 `acext.int8_gemm`，thead 平台内核 oracle 首选。
 4. **thead 启用 CUDA graph + 显存核算修复**：`support_static_graph_mode` 白名单、估算门控 `is_cuda()`→`is_cuda_alike()`、BreakableCUDAGraphWrapper 纳入 profiling、修复 allocator 缓存虚增 ~90 GiB 的估算 bug。单项收益最大（decode 从全 eager 到全图）。
 5. **qnorm 插入头填充快速路径**：padding 头槽位（FlashMLA 64 头要求 vs TP8 实际 8 头）跳过 RMSNorm/RoPE。
-6. benchmark 脚本对齐。
+6. **empty 隐式清零的定向修复**（`f615560`，**本轮收益最大：+14.3%**）：FlagGems 移除 `aten::empty` 接管后，暴露出 DeepSeek-V4 路径中隐式依赖清零的消费方。定位到真正的根因是 `DeepseekV4Model.topk_indices_buffer`——上游用 `torch.empty` 分配、每步只写当前 token 的行，而 **CUDA graph replay 会读取整个捕获范围**，padding 行的内存垃圾成为越界 int32 索引，导致 sparse attention gather 触发 IMA。改法：显式 `fill_(-1)`（`-1` 是 indexer 自身的「无索引」哨兵）+ qnorm padding buffer 改回 `torch.zeros` + 新增 `ops/empty_int_zero.py` 作为兜底（只对整数/bool dtype 清零，浮点大激活缓冲完全跳过 kernel）。
+7. benchmark 脚本对齐。
 
-### 3.2 FlagGems（[PR #1](https://github.com/ziyuhu214/FlagGems/pull/1)，5 提交）
+### 3.2 FlagGems（[PR #1](https://github.com/ziyuhu214/FlagGems/pull/1)，6 提交）
 
 1. **软件 E4M3FN 编码器**：PPU Triton 无 `fp8e4nv` 类型，纯位运算 RNE 实现（含 subnormal），替换 fp8 KV cache 全部 7 处存储点。
 2. **sqlite 调优缓存 busy timeout** 5s→120s：修复 TP=8 并发调优 `database is locked` 崩溃。
-3. **int64 scale 偏移**（正确性修复）：`cp_gather_indexer_quant_cache` int32 溢出，KV cache >8K 块时 IMA 崩溃。
+3. **int64 scale 偏移**（防御性加固）：`cp_gather_indexer_quant_cache` 的 scale 偏移原在 int32 下计算，长上下文下有溢出隐患；按本部署规模（约 2.7k 块）尚未触发，属预防性修复。
 4. **qnorm kernel `num_real_heads` 快速路径**（与 plugin 第 5 项配套）。
-5. **empty_kernel 依赖警告注释**：见 §4 结论 1。
+5. **empty_kernel 依赖警告注释**（09-01，已被下一条取代）。
+6. **移除 `aten::empty` 接管**（`c993b3c8`，对齐上游 PR #5438）：该 triton kernel 顺带清零，代价是 DeepSeek-V4 decode **每步约 3000 次 kernel 启动**。改由 plugin 侧定向修复承接（见 §3.1 第 6 项）。
 
 ## 4. Profiling 结果与剩余优化方向
 
@@ -106,7 +111,7 @@ H100 数据（8×H100 80GB，vLLM 0.26.0，FP8 模型）：
 | deep_gemm int8 GEMM（MoE up/down） | 6.6 | 12.4% | 同款内核，无差距 |
 | deep_gemm batched_gemvt（dense 小批量） | 5.3 | 9.9% | 同款，无差距 |
 | flash sparse decode attention | 4.7 | 8.8% | 同款 wheel，无差距 |
-| **empty_kernel（3007 次/步）** | 3.4 | 6.3% | **纯 FL 栈损耗**（结论 1） |
+| **empty_kernel（3003 次/步）** | 5.8 | 5.2% | **纯 FL 栈损耗 → 已消除**（结论 1） |
 | aiu cutlass GEMM（acext 线性层） | ~3.0 | 5.6% | 同款，无差距 |
 | hc_prenorm GEMM（mHC 内 tilelang） | 2.7+1.3 | 7.4% | 同款内核 |
 | 通信（twoShot+RING） | 3.8 | 7.2% | pccl 相同；T-Head 或有编译版 custom allreduce 略优 |
@@ -118,11 +123,12 @@ H100 数据（8×H100 80GB，vLLM 0.26.0，FP8 模型）：
 
 重计算算子（GEMM / attention / MoE，合计约 60%）与 T-Head 完全同源，**这部分没有差距**。剩余差距全部来自 FL 栈的粘合层：
 
-1. **empty_kernel 6.3%**：FlagGems 把 `torch.empty` 换成了「写零」triton kernel（每步 3007 次启动）。直接去掉会触发 compressor IMA——下游代码隐式依赖这个非标准的清零行为。这是真实的 FlagGems 上游问题（empty 语义被污染），修复需先审计依赖方；已提交带警告注释的 commit 存档（FlagGems `8d3179b0`）。
-2. **小 kernel 启动过多**：每步 5000+ 次 kernel 启动（empty 3007 + copy 649 + quant 368 + mHC 260 + …），T-Head 的 C++ 融合算子把这些全部合并。profile 给出精确损耗：**约 6–8ms/step，即 TPOT 差距 11ms 的大部分**。突破需编译 C++ 扩展或等 PPU inductor 工具链成熟。
-3. **mHC 重复计算（可修，预期收回 ~1ms/step）**：每步 87 次 mhc_pre + 86 次 mhc_post——fused_post_pre 版本没被用上，opaque 包装走了拆开路径。
+1. **empty_kernel 5.2% —— ✅ 已消除（本轮最大收益）**：FlagGems 把 `torch.empty` 换成了「写零」triton kernel，每步 3003 次启动、5.81 ms/步。最初判断是「删不掉」（下游隐式依赖清零，去掉即触发 IMA），FlagGems `8d3179b0` 还为此加了警告注释。次日改为**定位真正的依赖方并显式初始化**（`topk_indices_buffer.fill_(-1)`，见 §3.1 第 6 项）后成功移除。
+   **机制自洽验证**：profile 测得该 kernel 5.81 ms/步，实测 TPOT 下降 5.95 ms（44.00 → 38.04），两者相差不到 3%，收益来源得到独立印证。
+2. **小 kernel 启动过多**：移除 empty 后仍有每步约 2000 次启动（copy 649 + quant 368 + mHC 260 + …），T-Head 的 C++ 融合算子把这些全部合并。突破需编译 C++ 扩展或等 PPU inductor 工具链成熟。
+3. **mHC 重复计算（可修，预期收回 ~1ms/步）**：profile 中 `mhc_pre_big_fuse_with_norm` 8514 次、`mhc_post` 8429 次，而同层参照算子（`fused_qnorm_rope_kv_insert` 4257 次 = 43 层 × 99 步）恰为 1.00×——即 mHC 精确地每步跑了两遍，`fused_post_pre` 融合路径没被用上，opaque 包装走了拆开路径。这是当前唯一已数值确认、纯软件可修的优化项。
 
-其余遗留（KV cache 24 vs 37 GiB、compile 模式长输入 OOM 需 util 0.82、首启慢等）见 `PORTING_REPORT.md` 第六、七节。
+KV cache 现状（实测）：可用 30.73 GiB / 172,329 tokens，cudagraph 预留 3.35 GiB，为基线容量（36.73 GiB / 203,303 tokens）的 **84.8%**——比 `PORTING_REPORT.md` §七记录的「24 vs 37 GiB、cg 预留 9.1 GB」已明显改善，该遗留事项的严重性应下调。其余遗留（compile 模式长输入 OOM 需 util 0.82、首启慢等）见 `PORTING_REPORT.md` 第六、七节。
 
 ## 5. 复现步骤
 
@@ -151,7 +157,8 @@ bash scripts/serve_dsv4_fl_bench.sh
 ## 附：目录说明
 
 ```
-PORTING_REPORT.md   完整移植与优化工程报告
+PORTING_REPORT.md       移植与优化工程报告（过程、算子归属图、诊断存档）
+MODIFICATIONS_REPORT.md  逐 commit 核查报告（每条改动的原因与证据出处）
 scripts/            服务启动、压测、模型下载脚本（thead 基线 + FL 栈）
 tuning/             deep_gemm 自动调优脚本与分 shard 输出（tune_out/）
 results/            benchmark summary/raw CSV、最终日志、profiler 摘要（profiles/）
@@ -159,11 +166,24 @@ chat_template/      DeepSeek-V4 chat template（与官方 encoding_dsv4.py 逐�
 ```
 
 ---
-*代码与压测由 Claude Code 完成（2026-08-25 ~ 2026-09-01）。*
+*代码与压测由 Claude Code 完成（2026-08-25 ~ 2026-09-02）。*
 
 ## 附录：原始数据
 
-社区栈最终配置的最后一次完整压测原始数据（2026-08-31，每用例 4 轮）。
+逐轮原始数据。**A.0 为当前最优配置（含 empty 定向修复，09-02）**；A.1–A.3 为 08-31 完整三用例（4096/16384 两档至今仍以此为准）；A.4 为 T-Head 厂商栈基线。
+
+### A.0 Case1 + empty 定向修复：1024/1024/conc64/256 prompts（util 0.85，**当前最优**）
+
+来源：`results/logs/case1_emptyfix_v2.log`（2026-09-02 16:38）。对应代码为 plugin `f615560` + FlagGems `c993b3c8`。4 轮全部 256/256 成功：
+
+| Run | Output tok/s | Total tok/s | Mean TTFT (ms) | Mean TPOT (ms) |
+|---|---|---|---|---|
+| 1（warmup） | 1336.84 | 2673.69 | 7475.99 | 40.59 |
+| 2 | 1484.06 | 2968.11 | 5135.23 | 38.13 |
+| 3 | 1489.26 | 2978.53 | 5138.00 | 37.97 |
+| 4 | 1487.31 | 2974.61 | 5142.58 | 38.03 |
+
+去首轮均值：**1486.88 tok/s / TPOT 38.04 ms**，轮间方差极小（±0.2%）。相对 A.1（1301.1）**+14.3%**，达 T-Head 基线的 86.5%。
 
 ### A.1 Case1：1024/1024/conc64/256 prompts（util 0.85）
 
@@ -200,7 +220,7 @@ chat_template/      DeepSeek-V4 chat template（与官方 encoding_dsv4.py 逐�
 | 3 | 776.49 | 0.33 | 337.60 | 5739.26 | 32681.06 | 143228.59 | 157.65 | 186.96 |
 | 4 | 775.23 | 0.33 | 338.15 | 5748.54 | 32684.00 | 143247.92 | 157.34 | 186.46 |
 
-汇总口径说明：§2 各表引用的最终值为**4 轮去首轮取均值**（首轮含 warmup 影响）——case1 (1304.57+1304.42+1294.40)/3 ≈ 1301，case2 ≈ 702，case3 ≈ 334。各轮数据如上完整列出供复核。
+汇总口径说明：§2 各表引用的值均为**4 轮去首轮取均值**（首轮含 warmup 影响）——case1 现为 A.0 的 1486.9（此前 A.1 为 1301.1），case2 ≈ 702，case3 ≈ 334。各轮数据如上完整列出供复核。
 
 ### A.4 T-Head 厂商栈基线（2026-08-26，同硬件同压测参数）
 
