@@ -1,0 +1,8 @@
+===== 1024/1024 run 1/4  (other-cards util: 0) =====
+Successful requests:                     256       
+Benchmark duration (s):                  180.51    
+Output token throughput (tok/s):         1452.22   
+Total token throughput (tok/s):          2904.44   
+Mean TTFT (ms):                          6532.91   
+Mean TPOT (ms):                          37.71     
+===== 1024/1024 run 2/4  (other-cards util: 0) =====

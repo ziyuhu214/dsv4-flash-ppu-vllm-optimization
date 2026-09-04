@@ -1,0 +1,25 @@
+===== Run 1/4 =====
+Successful requests:                     256       
+Output token throughput (tok/s):         1460.23   
+Total token throughput (tok/s):          2920.46   
+Mean TTFT (ms):                          6526.54   
+Mean TPOT (ms):                          37.47     
+===== Run 2/4 =====
+Successful requests:                     256       
+Output token throughput (tok/s):         1637.58   
+Total token throughput (tok/s):          3275.16   
+Mean TTFT (ms):                          4194.68   
+Mean TPOT (ms):                          35.00     
+===== Run 3/4 =====
+Successful requests:                     256       
+Output token throughput (tok/s):         1641.80   
+Total token throughput (tok/s):          3283.60   
+Mean TTFT (ms):                          4185.05   
+Mean TPOT (ms):                          34.91     
+===== Run 4/4 =====
+Successful requests:                     256       
+Output token throughput (tok/s):         1637.09   
+Total token throughput (tok/s):          3274.17   
+Mean TTFT (ms):                          4188.62   
+Mean TPOT (ms):                          35.02     
+DONE
