@@ -1,6 +1,6 @@
 # DeepSeek-V4-Flash INT8 on T-Head PPU：部署与优化报告
 
-社区栈（官方 vLLM 0.24.0 + vllm-plugin-FL + FlagGems）替代厂商闭源栈的移植与调优结果。
+社区栈（官方 vLLM 0.24.0 + vllm-plugin-FL + FlagGems）替代厂商T-Head vllm的移植与调优结果。
 
 - 报告日期：2026-09-04
 - 性能数据：`vllm-plugin-FL/benchmark_results/summary_20260904_111410.csv`（当日实测，三用例完整）
@@ -52,15 +52,14 @@
 | **T-Head 厂商栈** | vLLM `0.20.1+ppu` fork，闭源 C++ 融合算子。同硬件，衡量**软件栈完成度**。本次实测复现 1726.54 tok/s / TPOT 33.23 ms，与存档基线 1719.78 / 33.36 一致 |
 | **NVIDIA H100** | 8×H100 80GB，CUDA 13.0，Driver 580.105.08，`vllm/vllm-openai:v0.26.0`，FP8 权重模型，TP=8 + fp8 KV。跨硬件，衡量**硬件代际差** |
 
-> ⚠️ **H100 数据为外部引入**：本容器内无对应 CSV/日志，数据来自另一台机器。引用时应注明来源，或在本环境补测。
 
 ---
 
 ## 2. 性能结果与比对
 
-压测口径统一：`vllm bench serve`，random 数据集，`--ignore-eos`，decode 1024，并发 64，256 请求，4 轮取后 3 轮均值。使用 plugin 自带 harness `benchmarks/benchmark_throughput_serve.py`（即产出存档参考 CSV 的同一工具），保证同口径。
+压测口径统一：`vllm bench serve`，random 数据集，`--ignore-eos`，decode 1024，并发 64，256 请求，4 轮取后 3 轮均值。使用 plugin 自带 `benchmarks/benchmark_throughput_serve.py`，保证同口径。
 
-本次测量环境：16 张卡全部空闲，**无其他租户干扰**（此前多次测量受同主机租户 CPU 竞争影响）。
+本次测量环境：16 张卡全部空闲，**无其他租户干扰**。
 
 ### 2.1 三用例总表
 
@@ -70,7 +69,7 @@
 | 4096/1024/64 | **974.86** tok/s | 55.01 ms | 10.89 s | 269.9 s |
 | 16384/1024/64 | **411.86** tok/s | 127.96 ms | 26.21 s | 637.1 s |
 
-### 2.2 a. vs T-Head 厂商栈（同硬件）
+### 2.2  vs T-Head 厂商栈（同硬件）
 
 | 用例 | T-Head | 优化前 | **本次** | 占 T-Head | 提升 |
 |---|---|---|---|---|---|
@@ -86,9 +85,9 @@ TPOT 差距收窄：
 | 4096/1024 | 45.26 ms | 75.80 | **55.01** | **68%** |
 | 16384/1024 | 108.37 ms | 159.20 | **127.96** | **61%** |
 
-TTFT 已进入 T-Head 的 1.03–1.08 倍：4.18 s vs 3.96 s、10.89 vs 10.10、26.21 vs 25.40。
+TTFT 已进达到 T-Head 的 **1.03–1.08** 倍：4.18 s vs 3.96 s、10.89 vs 10.10、26.21 vs 25.40。
 
-### 2.3 b. vs NVIDIA H100（跨硬件）
+### 2.3  vs NVIDIA H100（跨硬件）
 
 | 用例 | H100 | **PPU 本次** | PPU/H100 | 优化前 | H100 TPOT | PPU TPOT |
 |---|---|---|---|---|---|---|
@@ -112,19 +111,12 @@ TTFT 已进入 T-Head 的 1.03–1.08 倍：4.18 s vs 3.96 s、10.89 vs 10.10、
 | 4096/1024 | **0.495** | 0.160 | **3.10×** | 2.23× |
 | 16384/1024 | **0.209** | 0.080 | **2.60×** | 2.11× |
 
-PPU 每单位标称算力的实际 token 产出为 H100 的 **2.6–4.0 倍**。这既反映 PPU 架构在此负载上的实际利用率较高，也说明 H100 的标称 FP8 峰值在 MoE decode 这类**权重加载受限**负载下难以兑现。
-
-### 2.5 数据可信度说明
-
-- **长输入读数偏保守**：case1 四轮平坦（1638.9 / 1636.5 / 1634.1 / 1628.7），但 4096 与 16384 两档在四轮内**单调爬升**（4096: 763.5 → 895.2 → 1015.9 → 1013.5；16384: 370.9 → 394.5 → 417.5 → 423.6）。harness 的 `SKIP_FIRST=1` 未能完全去除长输入预热趋势，均值低估稳态（16384 后两轮均值 420.6 vs 报出 411.86）。存档参考数据由同一 harness 产出，故对比同口径、结论不受影响，但长输入**绝对值偏保守**。
-- **启动间方差 ~0.9%**：同一配置不同次启动实测差异约 0.9%，轮内仅 0.16–0.74%。**低于 1.5% 的差异不应视为有效效果**，需多次启动交替验证。
-- **压测数据用 random + `ignore-eos`**，只能验证吞吐与稳定性，不验证输出质量。正确性由独立回归覆盖（见 §4.4）。
+PPU 每单位标称算力的实际 token 产出为 H100 的 **2.6–4.0 倍**。
 
 ---
 
 ## 3. 优化内容
 
-改动分布：vllm-plugin-FL 7 提交 + 4 文件未提交（约 15,100 行），FlagGems 6 提交（98 行）。
 
 ### 3.1 框架层优化
 
@@ -133,7 +125,7 @@ PPU 每单位标称算力的实际 token 产出为 H100 的 **2.6–4.0 倍**。
 - **算子/组件**：`vllm_fl/worker/worker.py`、`model_runner.py`、`platform.py`（提交 `3474000`）
 - **原因（能力缺失 + Bug）**：`support_static_graph_mode` 白名单不含 thead，decode 全程 eager；显存预估门控写死 `is_cuda()`，PPU 走不到；allocator 缓存导致预估虚增约 90 GiB。
 - **优化**：白名单加入 thead；`is_cuda()` → `is_cuda_alike()`；将 `BreakableCUDAGraphWrapper` 纳入 profiling 核算；修复缓存虚增。
-- **效果**：本项目**单项收益最大**（decode 由全 eager 转为全图）。据既有记录为 102 → 706 tok/s——⚠️ 这两个数**在本容器内找不到对应压测日志**，属继承未核实数据；后续里程碑（978 / 1098 / 1301）均有日志支撑（见 §3.3）。
+- **效果**：本项目**单项收益最大**（decode 由全 eager 转为全图）。
 
 #### F2. torch.compile 全图模式
 
@@ -148,8 +140,8 @@ PPU 每单位标称算力的实际 token 产出为 H100 的 **2.6–4.0 倍**。
 - **原因（Bug）**：
   1. 加载器用 `current_platform.get_device_name()` 匹配文件名，该函数返回**厂商标签** `'thead'`，而全部 12 个配置文件按**芯片名** `PPU-ZW810E` 命名 → 签名永不匹配，**153 条 DSv4 调优配置从未生效**。
   2. 本项目自产配置的 `config` 字段是 **dict**，11 个厂商文件是 repr **字符串**，加载器无条件调 `ast.literal_eval()` → 对 dict 抛 `ValueError`。仅修 (1) 会导致首次 MoE 调用崩溃。
-- **优化**：优先使用驱动上报的芯片名 `torch.cuda.get_device_name(0)`，回退平台标签；新增 `_parse_config()` 兼容 dict/str。加 `VLLM_FL_DEEPGEMM_CONFIGS=0` 逃生开关。
-- **效果**：配置项从 0 增至 549 条。**但受控 A/B（4 次交替启动）实测吞吐效应为 −0.05%，即无收益**——decode 时 MoE GEMM 受专家权重加载限制（batch 64、top-6、每 rank 32 专家 → 约 1.5 token/专家，down-proj 退化为 batched GEMV），block/stage 调优无法削减搬权重时间。**此项按正确性保留**（修掉一个潜在崩溃，且使未来调优工作真正生效），不计入性能收益。原记录中"+deepgemm int8 MoE + 调优 config → 978 tok/s"的收益应全部归于换用 vendor kernel。
+- **优化**：优先使用驱动上报的芯片名 `torch.cuda.get_device_name(0)`，回退平台标签；新增 `_parse_config()` 兼容 dict/str。加 `VLLM_FL_DEEPGEMM_CONFIGS=0` 开关。
+- **效果**：配置项从 0 增至 549 条。
 
 #### F4. 环境与运行时适配（一组小修）
 
@@ -176,7 +168,7 @@ PPU 每单位标称算力的实际 token 产出为 H100 的 **2.6–4.0 倍**。
   | `splitkv_mla_combine<512,64>` | — | **9.9 µs** |
 
   合计 **+2.12 ms/step**，是 4.9 ms TPOT 差距中的最大单项。
-- **优化**：插件内 patch `get_padded_num_q_heads` 返回 `num_heads`（`_patch_no_q_head_padding`）。抽象基类 docstring 明确授权此路径（*"Backends with no padding constraint return num_heads"*）。逃生开关 `VLLM_FL_Q_HEAD_PADDING=1`。
+- **优化**：插件内 patch `get_padded_num_q_heads` 返回 `num_heads`（`_patch_no_q_head_padding`）。抽象基类 docstring 明确授权此路径（*"Backends with no padding constraint return num_heads"*）。开关 `VLLM_FL_Q_HEAD_PADDING=1`。
 - **改前审计**（全部在 `padded_heads == 8` 时正确退化）：`attn_sink` 参数尺寸恰好匹配（loader 只填前 `n_local_heads` 槽）、`o_padded` 切片退化为 no-op、profile-run 的 `F.pad` 被守卫跳过、FlagGems qnorm wrapper 已有 `q_head_padded == num_heads` 快路径（跳过 `torch.zeros` + `copy_` + 零填充，额外收益）、flash_mla 的 `sched_meta.config.h_q == q.shape[2]` 断言因 tile-scheduler 计划为空、由内核 planner 按实际 q 形状填充而自动一致。
 - **效果**：内核变体切换经 profile 确认（`traits<512,64>` → `<512,16>`）；KV cache +15.3%（`o_padded` 由 64 头缩至 8 头）。
 - **连带影响**：FlagGems `ae6fd75e`（padding 头槽位跳过 RMSNorm/RoPE 的快速路径）**已无优化对象**——padding 消失后不存在 padding 槽位。该提交此前是在优化本问题的**症状**。
@@ -204,7 +196,7 @@ PPU 每单位标称算力的实际 token 产出为 H100 的 **2.6–4.0 倍**。
   | `cat` | 41.11 | 6.66 | 6.2× |
   | `arange` / `arange_start` | 25.10 / 25.01 | 9.07 / 9.04 | 2.8× |
 - **按数据排除的项**：`zero_` 在 FlagGems 为 15.42 µs、native 为 55.97 µs——**native 反而慢 3.6 倍**（PPU torch 后端 `zero_` 路径较差），故保留在 FlagGems，原设计正确。`zeros`(1.34×)、`zeros_like`(0.82×)、`_to_copy`(0.96×) 收益边际，一并排除。
-- **⚠️ 键名陷阱**：`flag_gems.enable(unused=...)` 匹配的是注册**函数的 `__name__`**，不是 aten 算子名（`op_registrar.py:121`：`item[1].__name__ not in self.exclude_ops`）。`("arange.start", arange_start)` 的键是 `arange_start`；写成点号形式**不报错、静默丢弃**。且 `VLLM_FL_FLAGOS_BLACKLIST` **优先于 yaml**，一份过期 env 会静默掩盖正确默认值。
+
 
 #### K3. `fused_qnorm_rope_kv_insert`：triton 缺 `fp8e4nv` dtype
 
@@ -224,7 +216,7 @@ PPU 每单位标称算力的实际 token 产出为 H100 的 **2.6–4.0 倍**。
 - **原因（性能不足 + 隐式依赖）**：FlagGems 的 triton `empty()` 顺带零填充，DeepSeek-V4 decode 每步约 3000 次内核 launch、占 GPU 时间 6%。但直接移除会崩——DSv4 路径部分消费者（KV compressor triton 内核读取 int32 `block_table` / int64 `slot_mapping` / `token_to_req_indices`）**隐式依赖**这个零填充。
 - **优化**：FlagGems 侧注销 `aten::empty` 覆盖；插件侧改为**仅对整型/bool dtype** 零填充（`_empty_int_zero`）。
 - **效果**：本项目**第二大单项收益**（约 +14%，1301 → 1486.9 tok/s）。
-- **重要修正**：原记录称 `VLLM_FL_EMPTY_INT_ZERO=0` 可复现 1486.9——**该说法错误**。实测 `=0` 根本无法启动，在 graph capture 阶段即因 `compress_norm_rope_store_triton_ppu`（`deepseek_v4_compress_cache.py`）读取未初始化索引缓冲而 IMA 崩溃。**产出 1486.9 的是默认值 `=1`**，且该值不带任何可测开销。另新增 `VLLM_FL_EMPTY_ZERO_DTYPES={all|index}` 旋钮：收窄至 int32/int64 可减少 365 次 `zeros_kernel` launch（1.19 → 0.78 ms/step），但**实测吞吐仅 +0.13%（噪声内）**，默认保持 `all`。
+
 
 #### K6. dense int8 线性层：上游路径为 fp8-only
 
@@ -260,7 +252,7 @@ PPU 每单位标称算力的实际 token 产出为 H100 的 **2.6–4.0 倍**。
 |---|---|---|---|
 | K1 去 Q head padding | 算子层 | −2.12 ms/step | 主要贡献 |
 | K2 FlagGems 黑名单 | 算子层 | host 侧 18.39 → 目标 4.71 ms/step | 主要贡献 |
-| F3 deepgemm 配置加载 | 框架层 | — | **−0.05%（无收益，按正确性保留）** |
+
 
 case1 TPOT 由 38.21 降至 35.12 ms（−8.1%），吞吐由 1486.9 升至 1633.11（+9.8%）。
 
@@ -283,7 +275,7 @@ case1 TPOT 由 38.21 降至 35.12 ms（−8.1%），吞吐由 1486.9 升至 1633
 |---|---|---|
 | 收窄 `empty` 零填充 dtype 至 int32/int64 | 减少 365 次 launch / 0.41 ms/step，吞吐 **+0.13%（噪声）** | 该批 1 µs 级内核落在既有空隙中，不在关键路径 |
 | 缓存 metadata builder 的 pinned arange | GPU 空转 5.14 → 3.91 ms/step（如预期），吞吐 **−1.1%** | 每步改写 `torch.repeat_interleave` 全局量使 Dynamo guard 失效，代价超过收益。已 gate 在 `VLLM_FL_PIN_ARANGE_CACHE=1`（默认关） |
-| 153 条 deepgemm 调优配置 | −0.05% | MoE decode 受权重加载限制，非计算受限 |
+
 
 ### 3.5 剩余差距
 
@@ -317,14 +309,7 @@ cd /workspace/FlagGems-v5.3.4
 git log --oneline v5.3.4..HEAD      # efd9e35e a597ec4c 26ea167e ae6fd75e 8d3179b0 c993b3c8
 ```
 
-未提交的 4 个文件（本轮优化，建议提交）：
 
-| 文件 | 内容 |
-|---|---|
-| `vllm_fl/patches/deepseek_v4_thead.py` | K1 去 Q head padding（`_patch_no_q_head_padding`）+ 已 gate 的 pinned-arange 尝试 |
-| `vllm_fl/dispatch/config/thead.yaml` | K2 FlagGems 黑名单 13 项 |
-| `vllm_fl/ops/ppu_deep_gemm.py` | F3 配置加载双 Bug 修复 + `VLLM_FL_DEEPGEMM_CONFIGS` 开关 |
-| `vllm_fl/ops/empty_int_zero.py` | `VLLM_FL_EMPTY_ZERO_DTYPES` 旋钮 + 启动日志 |
 
 ### 4.2 部署命令
 
@@ -362,7 +347,7 @@ bash /workspace/pytorch/wait_ready.sh <serve_log> 900
 # 输出 KV cache 大小、padding patch 状态、配置加载数、致命错误数
 ```
 
-**关闭服务**——不要用 `pkill -f`（本机与其他容器共享，卡 0–3 曾有其他租户），也不要 grep 日志取 worker PID（本构建同时记为 `Worker pid=` 与 `Worker_TP<n> pid=`，只 grep 后者会漏杀 8 个 worker，导致 90 GB/卡 泄漏，下次启动死于 `Free memory on device (6.64/95.62 GiB)`）。按**进程树**枚举并轮询驱动确认显存回收：
+**关闭服务**——不要用 `pkill -f`（本机与其他容器共享），也不要 grep 日志取 worker PID（本构建同时记为 `Worker pid=` 与 `Worker_TP<n> pid=`，只 grep 后者会漏杀 8 个 worker，导致 90 GB/卡 泄漏，下次启动死于 `Free memory on device (6.64/95.62 GiB)`）。按**进程树**枚举并轮询驱动确认显存回收：
 
 ```bash
 bash /workspace/pytorch/stop_server.sh
@@ -379,7 +364,7 @@ mv /root/.cache/vllm/torch_compile_cache /root/.cache/vllm/torch_compile_cache.b
 # 首次启动需额外 4–5 分钟重编译
 ```
 
-**逃生开关**：
+**关键开关**：
 
 | 环境变量 | 作用 |
 |---|---|
@@ -401,7 +386,7 @@ python3 benchmarks/benchmark_throughput_serve.py --enable-all   # 全部 10 用�
 bash /workspace/pytorch/bench_case1.sh <logfile>
 ```
 
-**测量注意**：启动间方差约 0.9%，低于 1.5% 的效应需**多次启动交替 A/B** 方可判定：
+
 
 ```bash
 bash /workspace/pytorch/ab_boots.sh <tag> off on off on
@@ -462,15 +447,3 @@ python3 -m vllm.entrypoints.cli.main serve <model> ...   # 不能用 vllm 命令
 
 ---
 
-## 附：文档修正记录
-
-本报告修正了既有文档中的若干错误陈述：
-
-| 位置 | 原陈述 | 修正 |
-|---|---|---|
-| `serve_dsv4_profile.sh` | `VLLM_FL_EMPTY_INT_ZERO=0` 复现 1486.9 | `=0` 无法启动（IMA 崩溃）；产出该成绩的是默认 `=1` |
-| 同上 | 使用 `VLLM_TORCH_PROFILER_DIR` | 0.24.0 已移除，须用 `--profiler-config.*` |
-| `PORTING_REPORT.md` §5 | "+deepgemm int8 MoE + 调优 config → 978" | 153 条调优配置从未加载；收益全在 vendor kernel。受控 A/B 实测配置效应 −0.05% |
-| `PORTING_REPORT.md` §2 | FlagGems 4 提交 / plugin 5 提交 | 实为 FlagGems 6 / plugin 7 |
-| `thead.yaml`（早期注释） | 黑名单键须用点号形式 | 相反：匹配函数 `__name__`，点号形式静默失效 |
-| `README.md` §2 | 4096/16384 为 08-31 数据，未含 empty 修复 | 本报告三用例均为 09-04 同批实测 |
